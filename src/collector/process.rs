@@ -12,6 +12,102 @@ pub struct ProcInfo {
     pub command: String,
 }
 
+/// Observe a verified bare CLI process without guessing transcript ownership.
+/// Argument-bearing service/daemon/wrapper processes are deliberately excluded.
+#[cfg(target_os = "linux")]
+pub(crate) fn bare_agent_session(
+    pid: u32,
+    agent: &'static str,
+    process_info: &HashMap<u32, ProcInfo>,
+    config_root: String,
+) -> Option<crate::model::AgentSession> {
+    let label = match agent {
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        _ => return None,
+    };
+    let proc = process_info.get(&pid)?;
+    let root = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let command = fs::read(root.join("cmdline")).ok()?;
+    let args: Vec<_> = command
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .collect();
+    // Do not create rows for daemons, help/version commands, wrappers, or exec.
+    // Transcript-backed discovery handles argument-bearing commands separately.
+    if args.len() != 1 || !cmd_first_token_has_binary(&proc.command, agent) {
+        return None;
+    }
+    let actual_command = std::str::from_utf8(args[0]).ok()?;
+    if actual_command != proc.command {
+        return None;
+    }
+    let stat = fs::read_to_string(root.join("stat")).ok()?;
+    let start_ticks = stat
+        .get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()?;
+    let boot_seconds = fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .parse::<u64>()
+        .ok()?;
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return None;
+    }
+    let started_at = boot_seconds
+        .saturating_mul(1000)
+        .saturating_add(start_ticks.saturating_mul(1000) / ticks_per_second as u64);
+    let cwd =
+        super::sanitize_terminal_text(&fs::read_link(root.join("cwd")).ok()?.to_string_lossy());
+    let project_name = last_path_segment(&cwd).unwrap_or("?").to_string();
+    Some(crate::model::AgentSession {
+        agent_cli: agent,
+        launch_surface: crate::model::LaunchSurface::Cli,
+        pid,
+        // PID plus kernel start time avoids reusing identity after PID reuse.
+        session_id: format!("{agent}-process:{pid}:{start_ticks}"),
+        cwd,
+        project_name,
+        started_at,
+        status: crate::model::SessionStatus::Unknown,
+        model: "-".to_string(),
+        effort: String::new(),
+        context_percent: 0.0,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_cache_read: 0,
+        total_cache_create: 0,
+        turn_count: 0,
+        current_tasks: vec![format!("{label} running; transcript unavailable")],
+        mem_mb: proc.rss_kb / 1024,
+        version: String::new(),
+        git_branch: String::new(),
+        git_added: 0,
+        git_modified: 0,
+        token_history: vec![],
+        context_history: vec![],
+        compaction_count: 0,
+        context_window: 0,
+        subagents: vec![],
+        mem_file_count: 0,
+        mem_line_count: 0,
+        children: vec![],
+        initial_prompt: String::new(),
+        first_assistant_text: String::new(),
+        chat_messages: vec![],
+        tool_calls: vec![],
+        pending_since_ms: 0,
+        thinking_since_ms: 0,
+        file_accesses: vec![],
+        config_root,
+    })
+}
+
 /// Resolve all symlinks in /proc/{pid}/fd, returning their targets.
 /// Used by both port discovery (socket inodes) and Codex JSONL discovery.
 #[cfg(target_os = "linux")]

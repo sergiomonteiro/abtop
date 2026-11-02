@@ -1,9 +1,9 @@
-use super::{process, context_window_for_model};
+use super::{context_window_for_model, process};
 use crate::model::{AgentSession, ChildProcess, LaunchSurface, SessionStatus};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Maximum sessions to fetch from the DB per query.
@@ -22,6 +22,7 @@ const MAX_SESSIONS: u32 = 20;
 /// derivation and the children walk run every tick using live process info.
 pub struct OpenCodeCollector {
     db_path: PathBuf,
+    diagnostics: super::CollectorDiagnostics,
     /// Whether sqlite3 CLI is available (checked once).
     sqlite3_available: Option<bool>,
     /// Cached DB rows from the last slow-tick query. Reused on fast ticks.
@@ -41,6 +42,7 @@ impl OpenCodeCollector {
         let db_path = windows_db_path(db_path);
         Self {
             db_path,
+            diagnostics: super::CollectorDiagnostics::new("opencode", "$XDG_DATA_HOME/opencode/opencode.db (default: ~/.local/share/opencode/opencode.db)"),
             sqlite3_available: None,
             cached_db_sessions: Vec::new(),
             #[cfg(target_os = "windows")]
@@ -52,18 +54,73 @@ impl OpenCodeCollector {
         if let Some(available) = self.sqlite3_available {
             return available;
         }
-        let available = Command::new("sqlite3").arg("--version").output().is_ok();
+        let available = Command::new("sqlite3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
         self.sqlite3_available = Some(available);
         available
     }
 
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
-        // Security: skip if db_path is a symlink (fail-closed)
-        if is_symlink(&self.db_path) || !self.db_path.exists() {
-            self.cached_db_sessions.clear();
-            return vec![];
+        let mut sessions = self.collect_db_sessions(shared);
+        #[cfg(target_os = "linux")]
+        for pid in Self::find_opencode_pids(&shared.process_info) {
+            if sessions.iter().any(|s| s.pid == pid) {
+                continue;
+            }
+            if let Some(session) = process::bare_agent_session(
+                pid,
+                "opencode",
+                &shared.process_info,
+                super::abbrev_path(self.db_path.parent().unwrap_or(std::path::Path::new("."))),
+            ) {
+                self.diagnostics.candidates += 1;
+                self.diagnostics.skip("process_only_transcript_unavailable");
+                sessions.push(session);
+            }
+        }
+        self.diagnostics.accepted = sessions.len();
+        if !sessions.is_empty() && self.diagnostics.errors.is_empty() {
+            self.diagnostics.state = "ok";
+        }
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
+        sessions
+    }
+
+    fn collect_db_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
+        self.diagnostics.candidates = 0;
+        self.diagnostics.accepted = 0;
+        self.diagnostics.skipped.clear();
+        self.diagnostics.processes = Self::find_opencode_pids(&shared.process_info).len();
+        // Preserve refresh errors on fast ticks until the next successful query.
+        self.diagnostics.state = if self.diagnostics.errors.is_empty() {
+            "empty"
+        } else {
+            "error"
+        };
+        match fs::symlink_metadata(&self.db_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.cached_db_sessions.clear();
+                self.diagnostics.errors.clear();
+                self.diagnostics.schema = None;
+                self.diagnostics.state = "source_missing";
+                return vec![];
+            }
+            Err(_) => {
+                self.cached_db_sessions.clear();
+                self.diagnostics.fail("database_metadata_unreadable");
+                return vec![];
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                self.cached_db_sessions.clear();
+                self.diagnostics.fail("database_symlink_rejected");
+                return vec![];
+            }
+            Ok(_) => {}
         }
         if !self.check_sqlite3() {
+            self.diagnostics.fail("sqlite3_unavailable");
             // The DB exists but we can't read it: on Windows sqlite3 is
             // usually not preinstalled, so say why sessions are missing
             // instead of failing silently.
@@ -89,6 +146,7 @@ impl OpenCodeCollector {
                 shared
                     .process_info
                     .get(&pid)
+                    .filter(|p| !is_service_command(&p.command))
                     .map(|p| (pid, p.command.as_str()))
             })
             .collect();
@@ -96,23 +154,48 @@ impl OpenCodeCollector {
         // Refresh DB rows on slow ticks only; reuse cache on fast ticks so
         // we don't fork sqlite3 every 2s.
         if shared.slow_tick {
-            if let Some(rows) = self.query_sessions() {
-                self.cached_db_sessions = rows;
+            match self.query_sessions() {
+                Ok(rows) => {
+                    self.cached_db_sessions = rows;
+                    self.diagnostics.errors.clear();
+                    self.diagnostics.state = "empty";
+                }
+                Err(reason) => {
+                    self.cached_db_sessions.clear();
+                    self.diagnostics.fail(reason);
+                }
             }
         }
 
+        let has_service = opencode_pids.iter().any(|pid| {
+            shared
+                .process_info
+                .get(pid)
+                .is_some_and(|p| is_service_command(&p.command))
+        });
         let now_ms = current_time_ms();
         let mut sessions = Vec::new();
 
         let mut claimed_pids = HashSet::new();
+        self.diagnostics.candidates = self.cached_db_sessions.len();
         for ds in &self.cached_db_sessions {
             let matched_pid =
                 Self::match_pid_to_session_once(&pid_commands, &ds.directory, &mut claimed_pids);
-            // Drop sessions whose process isn't running. (Done sessions are
-            // filtered out by MultiCollector::collect anyway, so emitting
-            // a Done row here would be dead code.)
-            let Some(matched_pid) = matched_pid else {
-                continue;
+            // A global service is not proof of PID ownership. Surface only
+            // recent, non-idle v2 activity as Unknown without exposing its PID.
+            let matched_pid = match matched_pid {
+                Some(pid) => pid,
+                None if has_service => {
+                    if let Some(reason) = ds.service_activity_rejection(now_ms) {
+                        self.diagnostics.skip(reason);
+                        continue;
+                    }
+                    0
+                }
+                None => {
+                    self.diagnostics.skip("no_process_ownership");
+                    continue;
+                }
             };
 
             let proc = shared.process_info.get(&matched_pid);
@@ -120,7 +203,9 @@ impl OpenCodeCollector {
 
             let age_ms = now_ms.saturating_sub(ds.time_updated);
             let since_update_secs = age_ms / 1000;
-            let status = if since_update_secs < 30 {
+            let status = if matched_pid == 0 {
+                SessionStatus::Unknown
+            } else if since_update_secs < 30 {
                 SessionStatus::Thinking
             } else {
                 let cpu_active = proc.is_some_and(|p| p.cpu_pct > 1.0);
@@ -146,7 +231,9 @@ impl OpenCodeCollector {
                     .to_string()
             };
 
-            let current_tasks = if matches!(status, SessionStatus::Waiting) {
+            let current_tasks = if matches!(status, SessionStatus::Unknown) {
+                vec!["recent database activity; process owner unknown".to_string()]
+            } else if matches!(status, SessionStatus::Waiting) {
                 vec!["waiting for input".to_string()]
             } else {
                 vec!["thinking...".to_string()]
@@ -187,11 +274,8 @@ impl OpenCodeCollector {
             };
 
             let context_window = context_window_for_model(&model, "", 0);
-            let context_percent = if context_window > 0 {
-                ((ds.total_input + ds.total_output) as f64 / context_window as f64) * 100.0
-            } else {
-                0.0
-            };
+            // Database totals cover the whole session, not the current request.
+            let context_percent = 0.0;
 
             sessions.push(AgentSession {
                 agent_cli: "opencode",
@@ -238,6 +322,14 @@ impl OpenCodeCollector {
         }
 
         sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
+        self.diagnostics.accepted = sessions.len();
+        if self.diagnostics.errors.is_empty() {
+            self.diagnostics.state = if sessions.is_empty() {
+                "no_active_sessions"
+            } else {
+                "ok"
+            };
+        }
         sessions
     }
 
@@ -300,24 +392,76 @@ impl OpenCodeCollector {
     }
 
     /// Run a single sqlite3 query and parse the JSON output.
-    fn run_query(&self, sql: &str) -> Option<Vec<Value>> {
-        let db = self.db_path.to_str()?;
+    fn run_query(&self, sql: &str) -> Result<Vec<Value>, &'static str> {
         let output = Command::new("sqlite3")
-            .args(["-readonly", "-json", db])
+            .args(["-readonly", "-json", "-cmd", ".timeout 1000"])
+            .arg(&self.db_path)
             .arg(sql)
             .output()
-            .ok()?;
+            .map_err(|_| "sqlite3_execution_failed")?;
         if !output.status.success() {
-            return None;
+            return Err("database_query_failed");
         }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.trim().is_empty() {
-            return Some(vec![]);
+        if output.stdout.iter().all(u8::is_ascii_whitespace) {
+            return Ok(vec![]);
         }
-        serde_json::from_str(stdout.trim()).ok()
+        serde_json::from_slice(&output.stdout).map_err(|_| "database_result_invalid")
     }
 
-    fn query_sessions(&self) -> Option<Vec<DbSession>> {
+    fn query_v2_sessions(&self) -> Result<Vec<DbSession>, &'static str> {
+        let rows = self.run_query(&format!(
+            r#"
+SELECT s.id, s.title, s.directory, s.version, s.time_created, s.time_updated,
+ s.tokens_input, s.tokens_output, s.tokens_cache_read, s.tokens_cache_write,
+ s.time_idle, s.time_suspended,
+ CASE WHEN json_valid(s.model) THEN
+   COALESCE(json_extract(s.model, '$.id'), json_extract(s.model, '$.modelID'), '')
+   ELSE COALESCE(s.model, '') END AS model,
+ CASE WHEN json_valid(s.model) THEN
+   COALESCE(json_extract(s.model, '$.providerID'), '') ELSE '' END AS provider,
+ (SELECT COUNT(*) FROM session_message m
+  WHERE m.session_id = s.id AND m.type = 'assistant') AS turn_count
+FROM session_v2 s
+WHERE s.time_archived IS NULL
+ORDER BY s.time_updated DESC LIMIT {MAX_SESSIONS};"#
+        ))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DbSession {
+                id: sanitize_db_field(row["id"].as_str().unwrap_or(""), 256),
+                title: sanitize_db_title(row["title"].as_str().unwrap_or("")),
+                directory: sanitize_db_field(row["directory"].as_str().unwrap_or(""), 4096),
+                version: sanitize_db_field(row["version"].as_str().unwrap_or(""), 64),
+                time_created: row["time_created"].as_u64().unwrap_or(0),
+                time_updated: row["time_updated"].as_u64().unwrap_or(0),
+                service_activity: true,
+                time_idle: row["time_idle"].as_u64(),
+                time_suspended: row["time_suspended"].as_u64(),
+                project_name: String::new(),
+                turn_count: row["turn_count"].as_u64().unwrap_or(0) as u32,
+                total_input: row["tokens_input"].as_u64().unwrap_or(0),
+                total_output: row["tokens_output"].as_u64().unwrap_or(0),
+                total_cache_read: row["tokens_cache_read"].as_u64().unwrap_or(0),
+                total_cache_write: row["tokens_cache_write"].as_u64().unwrap_or(0),
+                model: sanitize_db_field(row["model"].as_str().unwrap_or(""), 256),
+                provider: sanitize_db_field(row["provider"].as_str().unwrap_or(""), 256),
+            })
+            .collect())
+    }
+
+    fn query_sessions(&mut self) -> Result<Vec<DbSession>, &'static str> {
+        // Introspect before querying: OpenCode 2.x stores cumulative usage on
+        // session_v2, whereas legacy releases store usage on each message.
+        let tables = self.run_query("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+        if tables.iter().any(|row| row["name"] == "session_v2") {
+            self.diagnostics.schema = Some("session_v2");
+            return self.query_v2_sessions();
+        }
+        if !tables.iter().any(|row| row["name"] == "session") {
+            self.diagnostics.schema = Some("unsupported");
+            return Err("unsupported_schema");
+        }
+        self.diagnostics.schema = Some("legacy");
         let session_sql = format!(
             r#"
 SELECT
@@ -358,7 +502,7 @@ LIMIT {};"#,
 
         // Two separate invocations to avoid fragile concatenated JSON parsing
         let rows = self.run_query(&session_sql)?;
-        let model_rows = self.run_query(&model_sql).unwrap_or_default();
+        let model_rows = self.run_query(&model_sql)?;
 
         // Build model lookup by session id
         let mut model_map: HashMap<String, (String, String)> = HashMap::new();
@@ -393,6 +537,9 @@ LIMIT {};"#,
                 // time_created and time_updated are in milliseconds since epoch
                 time_created: row["time_created"].as_u64().unwrap_or(0),
                 time_updated: row["time_updated"].as_u64().unwrap_or(0),
+                service_activity: false,
+                time_idle: None,
+                time_suspended: None,
                 project_name,
                 turn_count: row["turn_count"].as_u64().unwrap_or(0) as u32,
                 total_input: row["total_input"].as_u64().unwrap_or(0),
@@ -404,7 +551,7 @@ LIMIT {};"#,
             });
         }
 
-        Some(sessions)
+        Ok(sessions)
     }
 }
 
@@ -415,6 +562,14 @@ impl Default for OpenCodeCollector {
 }
 
 impl super::AgentCollector for OpenCodeCollector {
+    fn name(&self) -> &'static str {
+        "opencode"
+    }
+
+    fn diagnostics(&self) -> Option<super::CollectorDiagnostics> {
+        Some(self.diagnostics.clone())
+    }
+
     fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
     }
@@ -427,6 +582,9 @@ struct DbSession {
     version: String,
     time_created: u64,
     time_updated: u64,
+    service_activity: bool,
+    time_idle: Option<u64>,
+    time_suspended: Option<u64>,
     project_name: String,
     turn_count: u32,
     total_input: u64,
@@ -437,11 +595,28 @@ struct DbSession {
     provider: String,
 }
 
-/// Check if a path is a symlink (fail-closed: returns true on error).
-fn is_symlink(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(true)
+impl DbSession {
+    fn service_activity_rejection(&self, now_ms: u64) -> Option<&'static str> {
+        if !self.service_activity {
+            Some("service_session_without_lifecycle_evidence")
+        } else if self.time_suspended.is_some() {
+            Some("service_session_suspended")
+        } else if self.time_updated == 0 || self.time_updated > now_ms {
+            Some("service_session_invalid_timestamp")
+        } else if self.time_idle.is_some_and(|idle| idle >= self.time_updated) {
+            Some("service_session_idle")
+        } else if now_ms - self.time_updated >= 30_000 {
+            Some("service_session_stale")
+        } else {
+            None
+        }
+    }
+}
+
+fn is_service_command(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .any(|arg| matches!(arg, "serve" | "--service"))
 }
 
 fn sanitize_db_title(raw: &str) -> String {
@@ -562,6 +737,267 @@ fn current_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_collector(sql: &str) -> (tempfile::TempDir, OpenCodeCollector) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let output = Command::new("sqlite3")
+            .arg(&db_path)
+            .arg(sql)
+            .output()
+            .expect("SQLite CLI is required for database regression tests");
+        assert!(output.status.success(), "fixture creation failed");
+        let mut collector = OpenCodeCollector::new();
+        collector.db_path = db_path;
+        (dir, collector)
+    }
+
+    fn v2_fixture() -> (tempfile::TempDir, OpenCodeCollector) {
+        fixture_collector(
+            r#"
+CREATE TABLE session_v2 (
+ id TEXT, title TEXT, directory TEXT, version TEXT,
+ time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+ time_idle INTEGER, time_suspended INTEGER,
+ model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+ tokens_cache_read INTEGER, tokens_cache_write INTEGER);
+CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT);
+INSERT INTO session_v2 VALUES ('live', 'Example', '/tmp/project', '2.1.4',
+ 1000, 2000, NULL, NULL, NULL, '{"id":"gpt-5","providerID":"openai"}', 100, 20, 30, 4);
+INSERT INTO session_message VALUES ('a', 'live', 'assistant'), ('b', 'live', 'assistant'),
+ ('u', 'live', 'user');
+INSERT INTO session_v2 SELECT 'archived', title, directory, version,
+ time_created, time_updated, 3000, NULL, NULL, model, 999, 999, 999, 999 FROM session_v2;
+"#,
+        )
+    }
+
+    #[test]
+    fn query_v2_reads_session_totals_without_double_counting_messages() {
+        let (_dir, mut collector) = v2_fixture();
+        let rows = collector
+            .query_sessions()
+            .expect("v2 schema must be supported");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.id, "live");
+        assert_eq!((row.total_input, row.total_output), (100, 20));
+        assert_eq!((row.total_cache_read, row.total_cache_write), (30, 4));
+        assert_eq!(row.turn_count, 2);
+        assert_eq!((&*row.model, &*row.provider), ("gpt-5", "openai"));
+    }
+
+    #[test]
+    fn query_legacy_and_empty_database() {
+        let (_dir, mut collector) = fixture_collector(
+            r#"
+CREATE TABLE session (id TEXT, title TEXT, directory TEXT, version TEXT,
+ time_created INTEGER, time_updated INTEGER, project_id TEXT);
+CREATE TABLE project (id TEXT, name TEXT);
+CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+"#,
+        );
+        assert!(collector.query_sessions().unwrap().is_empty());
+        let output = Command::new("sqlite3")
+            .arg(&collector.db_path)
+            .arg(
+                r#"INSERT INTO session VALUES
+ ('legacy', 'Example', '/tmp/project', '1', 1000, 2000, 'project');
+INSERT INTO message VALUES ('message', 'legacy', 2000,
+ '{"role":"assistant","modelID":"gpt-5","tokens":{"input":10,"output":2}}');"#,
+            )
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let rows = collector.query_sessions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].total_input, 10);
+        assert_eq!(rows[0].total_output, 2);
+    }
+
+    fn shared_with_service() -> super::super::SharedProcessData {
+        super::super::SharedProcessData {
+            process_info: HashMap::from([(
+                u32::MAX,
+                process::ProcInfo {
+                    pid: u32::MAX,
+                    ppid: 1,
+                    rss_kb: 1024,
+                    cpu_pct: 99.0,
+                    // Even a matching service cwd argument must not establish ownership.
+                    command: "opencode serve --service --cwd=/tmp/project".into(),
+                },
+            )]),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: true,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::new(),
+        }
+    }
+
+    fn update_fixture(collector: &OpenCodeCollector, sql: &str) {
+        let output = Command::new("sqlite3")
+            .arg(&collector.db_path)
+            .arg(sql)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn service_activity_is_unknown_without_assigning_daemon_resources() {
+        let (_dir, mut collector) = v2_fixture();
+        update_fixture(
+            &collector,
+            &format!(
+                "UPDATE session_v2 SET time_updated = {} WHERE id = 'live';",
+                current_time_ms()
+            ),
+        );
+        let original = fs::read(&collector.db_path).unwrap();
+        let sessions = collector.collect_sessions(&shared_with_service());
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.status, SessionStatus::Unknown);
+        assert_eq!(session.pid, 0);
+        assert_eq!(session.mem_mb, 0);
+        assert_eq!(session.context_percent, 0.0);
+        assert!(session.children.is_empty());
+        assert_eq!(fs::read(&collector.db_path).unwrap(), original);
+        assert_eq!(collector.diagnostics.state, "ok");
+    }
+
+    #[test]
+    fn service_diagnostics_explain_idle_stale_and_suspended_filters() {
+        let (_dir, mut collector) = v2_fixture();
+        let now = current_time_ms();
+        for (sql, reason) in [
+            (
+                format!("UPDATE session_v2 SET time_updated = {now}, time_idle = {now}"),
+                "service_session_idle",
+            ),
+            (
+                format!(
+                    "UPDATE session_v2 SET time_idle = NULL, time_updated = {}",
+                    now - 60_000
+                ),
+                "service_session_stale",
+            ),
+            (
+                format!("UPDATE session_v2 SET time_updated = {now}, time_suspended = {now}"),
+                "service_session_suspended",
+            ),
+        ] {
+            update_fixture(&collector, &sql);
+            assert!(collector
+                .collect_sessions(&shared_with_service())
+                .is_empty());
+            assert_eq!(collector.diagnostics.skipped.get(reason), Some(&1));
+            assert!(collector.diagnostics.errors.is_empty());
+        }
+    }
+
+    #[test]
+    fn service_does_not_revive_historical_idle_suspended_or_future_rows() {
+        let (_dir, mut collector) = v2_fixture();
+        assert!(collector
+            .collect_sessions(&shared_with_service())
+            .is_empty());
+        let now = current_time_ms();
+        for sql in [
+            format!("UPDATE session_v2 SET time_updated = {now}, time_idle = {now}"),
+            format!("UPDATE session_v2 SET time_idle = NULL, time_suspended = {now}"),
+            format!(
+                "UPDATE session_v2 SET time_suspended = NULL, time_updated = {}",
+                now + 60_000
+            ),
+        ] {
+            update_fixture(&collector, &sql);
+            assert!(collector
+                .collect_sessions(&shared_with_service())
+                .is_empty());
+        }
+        assert!(collector.diagnostics.errors.is_empty());
+    }
+
+    #[test]
+    fn service_handles_multiple_recent_projects_without_claiming_one_pid() {
+        let (_dir, mut collector) = v2_fixture();
+        update_fixture(
+            &collector,
+            &format!(
+                r#"
+UPDATE session_v2 SET time_updated = {} WHERE id = 'live';
+INSERT INTO session_v2 SELECT 'second', title, '/tmp/other-project', version,
+ time_created, time_updated, NULL, NULL, NULL, model,
+ tokens_input, tokens_output, tokens_cache_read, tokens_cache_write
+ FROM session_v2 WHERE id = 'live';"#,
+                current_time_ms()
+            ),
+        );
+        let sessions = collector.collect_sessions(&shared_with_service());
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions
+            .iter()
+            .all(|s| s.pid == 0 && s.status == SessionStatus::Unknown));
+        let mut shared = shared_with_service();
+        shared.process_info.clear();
+        assert!(collector.collect_sessions(&shared).is_empty());
+    }
+
+    #[test]
+    fn query_failure_is_visible_and_clears_stale_cache_until_recovery() {
+        let (_dir, mut collector) = v2_fixture();
+        update_fixture(
+            &collector,
+            &format!("UPDATE session_v2 SET time_updated = {}", current_time_ms()),
+        );
+        let mut shared = shared_with_service();
+        assert!(!collector.collect_sessions(&shared).is_empty());
+        update_fixture(
+            &collector,
+            "ALTER TABLE session_message RENAME TO unsupported_messages",
+        );
+        assert!(collector.collect_sessions(&shared).is_empty());
+        assert_eq!(collector.diagnostics.errors, vec!["database_query_failed"]);
+        shared.slow_tick = false;
+        assert!(collector.collect_sessions(&shared).is_empty());
+        assert_eq!(collector.diagnostics.state, "error");
+        update_fixture(
+            &collector,
+            "ALTER TABLE unsupported_messages RENAME TO session_message",
+        );
+        shared.slow_tick = true;
+        assert!(!collector.collect_sessions(&shared).is_empty());
+        assert!(collector.diagnostics.errors.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_distinguish_unknown_schema_and_missing_database() {
+        let (_dir, mut collector) = fixture_collector("CREATE TABLE unknown_schema (id TEXT)");
+        let shared = shared_with_service();
+        assert!(collector.collect_sessions(&shared).is_empty());
+        assert_eq!(collector.diagnostics.errors, vec!["unsupported_schema"]);
+        collector.db_path.set_file_name("missing.db");
+        assert!(collector.collect_sessions(&shared).is_empty());
+        assert_eq!(collector.diagnostics.state, "source_missing");
+        assert!(collector.diagnostics.errors.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_do_not_expose_database_content_or_paths() {
+        let (_dir, mut collector) =
+            fixture_collector("CREATE TABLE secret_prompt (secret_response TEXT)");
+        collector.collect_sessions(&shared_with_service());
+        let report = serde_json::to_string(&collector.diagnostics).unwrap();
+        assert!(!report.contains("secret_prompt"));
+        assert!(!report.contains("secret_response"));
+        assert!(!report.contains(collector.db_path.to_str().unwrap()));
+        assert!(report.contains("unsupported_schema"));
+    }
 
     #[test]
     fn test_find_opencode_pids() {

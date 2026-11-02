@@ -10,6 +10,19 @@ use ratatui::Frame;
 use super::truncate_str;
 
 pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    if app
+        .collector_diagnostics()
+        .iter()
+        .any(|d| !d.errors.is_empty())
+    {
+        f.render_widget(
+            Paragraph::new(" Collection failed: run abtop --diagnose | q quit")
+                .style(Style::default().fg(theme.status_fg)),
+            area,
+        );
+        return;
+    }
+
     // Filter input mode: show filter bar instead of normal keybindings
     if app.filter_active {
         let visible_count = app.visible_indices().len();

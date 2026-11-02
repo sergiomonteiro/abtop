@@ -53,6 +53,7 @@ Pre-built binaries for all platforms are available on the [GitHub Releases](http
 abtop                    # Launch TUI
 abtop --once             # Print snapshot and exit
 abtop --json             # Print one JSON snapshot and exit (for scripts/tools)
+abtop --diagnose         # Print collector diagnostics without conversation content
 abtop --setup            # Install rate limit collection hook
 abtop --theme dracula    # Launch with a specific theme
 abtop --mouse            # Enable mouse click/scroll navigation
@@ -188,6 +189,69 @@ let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
 `App` is not `Send` (it owns the collectors), so keep it on one thread and pass
 the serialized JSON elsewhere. [abtop-web-ui](https://github.com/XKHoshizora/abtop-web-ui)
 is a reference consumer: a local-first web dashboard built on exactly this API.
+
+## Collector compatibility and diagnostics
+
+OpenCode supports the legacy `session`/`message` schema and the OpenCode 2.1.4
+`session_v2`/`session_message` schema. SQLite queries use `-readonly` with a bounded
+busy timeout. Install the `sqlite3` CLI to enable database collection and run the
+collector fixture tests. V2 token totals are read directly from the session row;
+reasoning tokens are not added to output a second time. Lifetime token totals are
+not used as current context usage, so OpenCode context percentage is unavailable
+(represented as zero in the current snapshot model).
+
+On Linux, a plain argument-free `opencode` terminal process is shown even if the
+database is missing or has no matching session. Its row is `Unknown`, labeled
+`OpenCode running; transcript unavailable`, and carries no inferred token totals.
+It uses the same verified process observation as the Codex process-only fallback.
+Service and daemon commands do not qualify for this fallback.
+
+A directly matched OpenCode process shows its newest session per PID. A global
+`opencode serve --service` process does not establish session ownership. With a
+running service, non-archived, non-suspended v2 rows updated in the last 30 seconds
+and not marked idle since that update appear as `Unknown`, with PID zero, no
+process memory or children, and no kill or terminal-jump action. This is a recent
+activity heuristic, not proof that the model is running. Older and idle unowned
+rows stay hidden; a service does not make every historical session live. The
+query considers at most 20 non-archived sessions, newest first.
+
+On Linux, Codex CLI and App Server ownership uses open rollout file descriptors.
+App Server FD discovery completes on the first tick, including `--once --json`.
+A plain, argument-free `codex` process without an open rollout is also shown on
+Linux, using its verified process cwd and kernel start time. The row is `Unknown`
+and labeled `Codex running; transcript unavailable`; token/context values are
+unavailable (represented as zero). It never borrows a recent historical rollout.
+When an owned rollout becomes available, the normal transcript row replaces it.
+The process-only fallback excludes App Servers, daemons, wrappers, and CLI
+subcommands/options; those still need FD-backed discovery. Restart a running
+abtop after rebuilding to load collector changes.
+
+A recent, FD-owned App Server rollout does not require the `Codex Desktop`
+originator label. App Server files older than 30 minutes remain excluded, even
+if the server still holds them open for resume. A daemon without eligible
+rollouts creates no session. Filesystem-only Desktop fallback still requires
+that label and shows `Unknown` without confirmed ownership; recent unowned CLI
+rollouts do not become live sessions merely because they were modified.
+
+```bash
+cargo run -- --diagnose       # Safe collection metadata, no generated summaries
+cargo run -- --once --json    # Normal session snapshot; includes private local data
+```
+
+`--diagnose` prints the version and enabled collectors, symbolic source locations,
+schema, process/candidate/accepted counts, aggregated filtering reasons, and
+static error codes. It takes precedence over `--json` and `--once`. Expanded
+private paths, SQL errors, database values, commands, and conversation text are
+omitted. Claude currently reports only basic counts with `not_instrumented`;
+detailed failure diagnostics cover OpenCode and Codex discovery.
+
+Normal JSON snapshots include `collector_errors` only when collection fails.
+The TUI also displays a collection failure message. Failed OpenCode refreshes
+clear cached rows, and the diagnostic error persists until a successful refresh.
+A missing source, an empty supported database, and an unsupported schema have
+different diagnostic states. OpenCode filtering distinguishes idle, stale,
+suspended, invalid-timestamp, and missing-ownership cases. See [the collector audit](docs/collector-audit.md)
+for confirmed causes and remaining limits.
 
 ## Privacy
 

@@ -835,6 +835,10 @@ impl Default for ClaudeCollector {
 }
 
 impl super::AgentCollector for ClaudeCollector {
+    fn name(&self) -> &'static str {
+        "claude"
+    }
+
     fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
     }

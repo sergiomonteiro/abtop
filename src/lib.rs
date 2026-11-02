@@ -144,6 +144,19 @@ pub fn run() -> io::Result<()> {
     let exit_on_jump = std::env::args().any(|a| a == "--exit-on-jump");
     let mouse_capture = should_enable_mouse_capture(std::env::args());
 
+    // Diagnostic output deliberately excludes the session snapshot, which can
+    // contain conversation data. This flag takes precedence over --json/--once.
+    if std::env::args().any(|a| a == "--diagnose") {
+        let mut app = build_app(initial_theme.unwrap_or_default(), &cfg);
+        app.tick_no_summaries();
+        let report = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "collectors": app.collector_diagnostics(),
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
     // --json flag: print a machine-readable JSON snapshot and exit.
     // Single tick, no summary subprocesses. Useful for scripting and as a
     // manual check of the web snapshot API; the web tool uses the library
