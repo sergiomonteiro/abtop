@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 /// - `turn_context`: model, cwd, effort, context window size
 pub struct CodexCollector {
     sessions_dir: PathBuf,
+    diagnostics: super::CollectorDiagnostics,
     /// Latest rate limit info parsed from Codex JSONL token_count events.
     pub last_rate_limit: Option<RateLimitInfo>,
     desktop_recent_scanner: DesktopRecentRolloutScanner,
@@ -110,15 +111,32 @@ impl CodexCollector {
         let home = dirs::home_dir().unwrap_or_default();
         Self {
             sessions_dir: home.join(".codex").join("sessions"),
+            diagnostics: super::CollectorDiagnostics::new("codex", "~/.codex/sessions"),
             last_rate_limit: None,
             desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
         }
     }
 
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
-        if !self.sessions_dir.exists() {
-            self.last_rate_limit = None;
-            return vec![];
+        self.diagnostics = super::CollectorDiagnostics::new("codex", "~/.codex/sessions");
+        self.diagnostics.schema = Some("rollout_jsonl");
+        self.diagnostics.processes = shared
+            .process_info
+            .values()
+            .filter(|p| process::cmd_has_binary(&p.command, "codex"))
+            .count();
+        match fs::read_dir(&self.sessions_dir) {
+            Ok(_) => {}
+            Err(e) => {
+                self.last_rate_limit = None;
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    self.diagnostics.state = "source_missing";
+                } else {
+                    self.diagnostics.fail("sessions_directory_unreadable");
+                }
+                // A bare interactive process can exist before its first rollout.
+                // Continue process discovery even when the sessions root is absent.
+            }
         }
 
         // Reset live rate limit each pass — only keep it if a current session provides one
@@ -131,10 +149,32 @@ impl CodexCollector {
             Self::find_codex_pids_from_shared(&shared.process_info, &shared.mcp_server_pids);
         let just_pids: Vec<u32> = codex_pids.iter().map(|(p, _)| *p).collect();
         let pid_to_jsonl = Self::map_pid_to_jsonl(&just_pids, &self.sessions_dir);
+        self.diagnostics.candidates += pid_to_jsonl.len();
+        for (pid, _) in &codex_pids {
+            if !pid_to_jsonl.contains_key(pid) {
+                self.diagnostics.skip("cli_without_open_rollout");
+                #[cfg(target_os = "linux")]
+                if fs::read_dir(format!("/proc/{pid}/fd")).is_err() {
+                    self.diagnostics.fail("process_fds_unreadable");
+                }
+            }
+        }
         let pid_is_exec: HashMap<u32, bool> = codex_pids.into_iter().collect();
 
         let mut sessions = Vec::new();
         let mut seen_jsonl = std::collections::HashSet::new();
+
+        #[cfg(target_os = "linux")]
+        for (&pid, &is_exec) in &pid_is_exec {
+            if !is_exec && !pid_to_jsonl.contains_key(&pid) {
+                if let Some(session) = self.load_process_without_rollout(pid, &shared.process_info)
+                {
+                    self.diagnostics.candidates += 1;
+                    self.diagnostics.skip("process_only_transcript_unavailable");
+                    sessions.push(session);
+                }
+            }
+        }
 
         // Active sessions: running codex processes with open JSONL files
         for (pid, jsonl_path) in &pid_to_jsonl {
@@ -163,6 +203,9 @@ impl CodexCollector {
                     }
                 }
                 sessions.push(session);
+            } else {
+                self.diagnostics
+                    .fail("rollout_unreadable_or_missing_metadata");
             }
         }
 
@@ -180,6 +223,31 @@ impl CodexCollector {
                         .map(|paths| (*pid, paths.clone()))
                 })
                 .collect();
+
+            let mut inspected = HashSet::new();
+            for paths in desktop_pid_to_rollouts.values() {
+                for path in paths {
+                    if !inspected.insert(path) {
+                        continue;
+                    }
+                    self.diagnostics.candidates += 1;
+                    if shared.mcp_owned_rollouts.contains(path) {
+                        self.diagnostics.skip("mcp_owned_rollout");
+                    } else if fs::metadata(path).is_err() {
+                        self.diagnostics.fail("rollout_metadata_unreadable");
+                    } else if !Self::is_recent_rollout(path, super::mcp::ACTIVE_MTIME_SECS) {
+                        self.diagnostics.skip("stale_rollout");
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            for pid in &desktop_pids {
+                if !desktop_pid_to_rollouts.contains_key(pid)
+                    && fs::read_dir(format!("/proc/{pid}/fd")).is_err()
+                {
+                    self.diagnostics.fail("process_fds_unreadable");
+                }
+            }
 
             // Prefer the filesystem view so Desktop sessions appear immediately,
             // then use the async fd cache only to improve PID ownership.
@@ -207,6 +275,11 @@ impl CodexCollector {
             Self::sort_rollouts_by_mtime_desc(&mut desktop_rollout_paths);
 
             for path in desktop_rollout_paths {
+                if !inspected.contains(&path) {
+                    self.diagnostics.candidates += 1;
+                    self.diagnostics
+                        .skip("recent_desktop_rollout_without_fd_owner");
+                }
                 let pid = desktop_pid_for_path.get(&path).copied();
                 let process_ctx = CodexProcessContext {
                     pid,
@@ -268,6 +341,9 @@ impl CodexCollector {
                         }
                     }
                     sessions.push(session);
+                } else {
+                    self.diagnostics
+                        .fail("rollout_unreadable_or_missing_metadata");
                 }
             }
         }
@@ -336,6 +412,19 @@ impl CodexCollector {
         }
 
         sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
+        self.diagnostics.accepted = sessions
+            .iter()
+            .filter(|s| !matches!(s.status, SessionStatus::Done))
+            .count();
+        if self.diagnostics.errors.is_empty() {
+            self.diagnostics.state = if self.diagnostics.accepted > 0 {
+                "ok"
+            } else if self.diagnostics.processes == 0 {
+                "no_processes"
+            } else {
+                "no_active_sessions"
+            };
+        }
         sessions
     }
 
@@ -353,7 +442,7 @@ impl CodexCollector {
         }
     }
 
-    fn is_active_desktop_rollout(path: &Path, active_mtime_secs: u64) -> bool {
+    fn is_recent_rollout(path: &Path, active_mtime_secs: u64) -> bool {
         let Ok(meta) = fs::metadata(path) else {
             return false;
         };
@@ -367,7 +456,12 @@ impl CodexCollector {
             return false;
         }
 
-        parse_codex_jsonl(path).is_some_and(|result| result.is_codex_desktop())
+        true
+    }
+
+    fn is_active_desktop_rollout(path: &Path, active_mtime_secs: u64) -> bool {
+        Self::is_recent_rollout(path, active_mtime_secs)
+            && parse_codex_jsonl(path).is_some_and(|result| result.is_codex_desktop())
     }
 
     fn active_desktop_rollouts(
@@ -395,7 +489,9 @@ impl CodexCollector {
                 !seen_jsonl.contains(path)
                     && !mcp_owned_rollouts.contains(path)
                     && emitted.insert(path.clone())
-                    && Self::is_active_desktop_rollout(path, active_mtime_secs)
+                    // An FD held by an app-server proves ownership without requiring
+                    // the Desktop-specific originator used by filesystem fallback.
+                    && Self::is_recent_rollout(path, active_mtime_secs)
             })
             .collect()
     }
@@ -524,6 +620,20 @@ impl CodexCollector {
                 candidates.push(path);
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn load_process_without_rollout(
+        &self,
+        pid: u32,
+        process_info: &HashMap<u32, ProcInfo>,
+    ) -> Option<AgentSession> {
+        process::bare_agent_session(
+            pid,
+            "codex",
+            process_info,
+            super::abbrev_path(self.sessions_dir.parent().unwrap_or(Path::new("."))),
+        )
     }
 
     fn load_session_with_rate_limit(
@@ -853,6 +963,14 @@ impl Default for CodexCollector {
 }
 
 impl super::AgentCollector for CodexCollector {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn diagnostics(&self) -> Option<super::CollectorDiagnostics> {
+        Some(self.diagnostics.clone())
+    }
+
     fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
     }
@@ -1802,6 +1920,110 @@ mod tests {
         assert_eq!(pids, vec![40]);
     }
 
+    fn app_server_shared(paths: Vec<PathBuf>) -> super::super::SharedProcessData {
+        super::super::SharedProcessData {
+            process_info: HashMap::from([(
+                99,
+                proc_info(99, 1, "codex app-server --listen unix://socket"),
+            )]),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: true,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::from([(99, paths)]),
+        }
+    }
+
+    #[test]
+    fn app_server_open_rollout_does_not_require_desktop_originator() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("rollout-active.jsonl");
+        let stale = dir.path().join("rollout-stale.jsonl");
+        write_jsonl(&active, &[SESSION_META]);
+        write_jsonl(&stale, &[SESSION_META]);
+        set_modified(&stale, SystemTime::now() - Duration::from_secs(31 * 60));
+        let shared = app_server_shared(vec![active.clone(), stale, active]);
+        let mut collector = CodexCollector::new();
+        collector.sessions_dir = dir.path().to_path_buf();
+        let sessions = collector.collect_sessions(&shared);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pid, 99);
+        assert_eq!(sessions[0].session_id, "sess-123");
+        assert!(sessions[0].children.is_empty());
+        assert_eq!(collector.diagnostics.accepted, 1);
+        assert_eq!(collector.diagnostics.skipped.get("stale_rollout"), Some(&1));
+    }
+
+    #[test]
+    fn app_server_malformed_rollout_is_reported_without_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-malformed.jsonl");
+        write_jsonl(&path, &["private-malformed-content"]);
+        let shared = app_server_shared(vec![path]);
+        let mut collector = CodexCollector::new();
+        collector.sessions_dir = dir.path().to_path_buf();
+        assert!(collector.collect_sessions(&shared).is_empty());
+        assert_eq!(
+            collector.diagnostics.errors,
+            vec!["rollout_unreadable_or_missing_metadata"]
+        );
+        let report = serde_json::to_string(&collector.diagnostics).unwrap();
+        assert!(!report.contains("private-malformed-content"));
+        assert!(!report.contains(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn app_server_daemon_without_rollouts_does_not_create_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut collector = CodexCollector::new();
+        collector.sessions_dir = dir.path().to_path_buf();
+        assert!(collector
+            .collect_sessions(&app_server_shared(vec![]))
+            .is_empty());
+    }
+
+    #[test]
+    fn app_server_mcp_owned_rollout_is_suppressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-active.jsonl");
+        write_jsonl(&path, &[SESSION_META]);
+        let mut shared = app_server_shared(vec![path.clone()]);
+        shared.mcp_owned_rollouts.insert(path);
+        let mut collector = CodexCollector::new();
+        collector.sessions_dir = dir.path().to_path_buf();
+        assert!(collector.collect_sessions(&shared).is_empty());
+    }
+
+    #[test]
+    fn parser_tolerates_new_events_partial_tail_and_repeated_cumulative_usage() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let usage = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":20},"last_token_usage":{"input_tokens":50,"output_tokens":10},"model_context_window":200000}}}"#;
+        write_lines(
+            &mut file,
+            &[
+                SESSION_META,
+                usage,
+                r#"{"type":"token_usage_record","payload":{}}"#,
+                r#"{"type":"world_state","payload":{}}"#,
+                r#"{"type":"compacted","payload":{}}"#,
+                usage,
+                r#"{"type":"event_msg","payload":"#,
+            ],
+        );
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        assert_eq!(
+            (
+                result.total_input,
+                result.total_cache_read,
+                result.total_output
+            ),
+            (60, 40, 20)
+        );
+        assert_eq!(result.last_context_tokens, 50);
+    }
+
     #[test]
     fn desktop_rollout_filter_requires_originator() {
         let mut desktop = tempfile::NamedTempFile::new().unwrap();
@@ -1820,7 +2042,7 @@ mod tests {
     }
 
     #[test]
-    fn active_desktop_rollouts_filters_stale_seen_and_cli_files() {
+    fn active_app_server_rollouts_filters_stale_and_seen_files() {
         let temp = tempfile::tempdir().unwrap();
         let active = temp.path().join("rollout-active.jsonl");
         let stale = temp.path().join("rollout-stale.jsonl");
@@ -1835,7 +2057,13 @@ mod tests {
         let mut pid_to_rollouts = HashMap::new();
         pid_to_rollouts.insert(
             99,
-            vec![active.clone(), stale, cli, seen.clone(), active.clone()],
+            vec![
+                active.clone(),
+                stale,
+                cli.clone(),
+                seen.clone(),
+                active.clone(),
+            ],
         );
         let seen_jsonl = HashSet::from([seen]);
 
@@ -1846,7 +2074,9 @@ mod tests {
             super::super::mcp::ACTIVE_MTIME_SECS,
         );
 
-        assert_eq!(rollouts, vec![(99, active)]);
+        assert_eq!(rollouts.len(), 2);
+        assert!(rollouts.contains(&(99, active)));
+        assert!(rollouts.contains(&(99, cli)));
     }
 
     #[test]
@@ -1970,6 +2200,7 @@ mod tests {
 
         let mut collector = CodexCollector {
             sessions_dir: sessions.path().to_path_buf(),
+            diagnostics: crate::collector::CollectorDiagnostics::new("codex", "~/.codex/sessions"),
             last_rate_limit: None,
             desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
         };
