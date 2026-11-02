@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod diagnostics;
 pub mod mcp;
 pub mod opencode;
 pub mod process;
@@ -7,6 +8,7 @@ pub mod rate_limit;
 
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
+pub use diagnostics::CollectorDiagnostics;
 pub use mcp::McpServer;
 pub use opencode::OpenCodeCollector;
 pub use rate_limit::read_rate_limits;
@@ -95,6 +97,14 @@ use std::time::{Duration, Instant};
 /// Trait for agent-specific session collectors.
 /// Implement this to add support for a new AI coding agent.
 pub trait AgentCollector {
+    fn name(&self) -> &'static str {
+        "custom"
+    }
+
+    fn diagnostics(&self) -> Option<CollectorDiagnostics> {
+        None
+    }
+
     /// Return all live sessions for this agent type.
     fn collect(&mut self, shared: &SharedProcessData) -> Vec<AgentSession>;
 
@@ -217,6 +227,11 @@ impl DesktopRolloutScanner {
     }
 
     fn update(&mut self, pids: &[u32]) -> HashMap<u32, Vec<PathBuf>> {
+        // Linux /proc reads are cheap and must finish on the first tick so
+        // --json sees App Server ownership before the process exits.
+        if cfg!(target_os = "linux") {
+            return mcp::map_pid_to_rollouts(pids);
+        }
         self.poll_completed();
         if self.should_start(pids) {
             self.start(pids.to_vec());
@@ -286,6 +301,7 @@ impl Drop for DesktopRolloutScanner {
 pub struct MultiCollector {
     collectors: Vec<Box<dyn AgentCollector>>,
     codex_enabled: bool,
+    pub diagnostics: Vec<CollectorDiagnostics>,
     tick_count: u32,
     cached_ports: HashMap<u32, Vec<u16>>,
     /// PID set snapshot from last port scan — invalidate cache when PIDs change.
@@ -339,6 +355,7 @@ impl MultiCollector {
         Self {
             collectors,
             codex_enabled,
+            diagnostics: Vec::new(),
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick
             cached_ports: HashMap::new(),
             cached_port_pids: Vec::new(),
@@ -412,8 +429,22 @@ impl MultiCollector {
         }
 
         let mut all = Vec::new();
+        self.diagnostics.clear();
         for collector in &mut self.collectors {
-            all.extend(collector.collect(&shared));
+            let sessions = collector.collect(&shared);
+            let report = collector.diagnostics().unwrap_or_else(|| {
+                let mut report = CollectorDiagnostics::new(collector.name(), "local configuration");
+                report.state = "not_instrumented";
+                report.processes = shared
+                    .process_info
+                    .values()
+                    .filter(|p| process::cmd_has_binary(&p.command, collector.name()))
+                    .count();
+                report.accepted = sessions.len();
+                report
+            });
+            self.diagnostics.push(report);
+            all.extend(sessions);
         }
 
         // Git stats: refresh only on slow tick
@@ -538,6 +569,18 @@ mod tests {
             "opencode".to_string(),
         ]);
         assert!(mc.collectors.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn app_server_fd_scan_is_available_on_first_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-first-tick.jsonl");
+        let _open_file = std::fs::File::create(&path).unwrap();
+        let pid = std::process::id();
+        let mut scanner = DesktopRolloutScanner::new();
+        let map = scanner.update(&[pid]);
+        assert!(map.get(&pid).unwrap().contains(&path));
     }
 
     #[test]

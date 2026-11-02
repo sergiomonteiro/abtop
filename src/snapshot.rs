@@ -23,6 +23,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Top-level snapshot returned by [`App::to_snapshot`].
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
+    /// Collection failures contain only static codes, never source contents.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub collector_errors: Vec<crate::collector::CollectorDiagnostics>,
     /// Unix-epoch milliseconds when this snapshot was built.
     pub generated_at_ms: u64,
     /// Host vitals (CPU / mem / load1). `None` on unsupported platforms or
@@ -279,6 +282,12 @@ impl App {
             .collect();
 
         Snapshot {
+            collector_errors: self
+                .collector_diagnostics()
+                .iter()
+                .filter(|d| !d.errors.is_empty())
+                .cloned()
+                .collect(),
             generated_at_ms: epoch_ms(now).unwrap_or(0),
             host: self.host_metrics,
             aggregate: self.agent_aggregate,

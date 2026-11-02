@@ -499,6 +499,11 @@ impl App {
         self.drain_and_retry_summaries();
     }
 
+    /// Privacy-preserving metadata from the most recent collector tick.
+    pub fn collector_diagnostics(&self) -> &[crate::collector::CollectorDiagnostics] {
+        &self.collector.diagnostics
+    }
+
     /// Refresh all monitored data WITHOUT spawning background summary jobs.
     ///
     /// `tick` additionally calls [`App::drain_and_retry_summaries`], which
@@ -799,6 +804,9 @@ impl App {
             return JumpOutcome::NoOp;
         }
         let target_pid = self.sessions[self.selected].pid;
+        if target_pid == 0 {
+            return JumpOutcome::NoOp;
+        }
         crate::jump::run_jump(target_pid)
     }
 
@@ -1012,7 +1020,43 @@ fn is_killable_agent_command(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PanelVisibility;
     use crate::model::LaunchSurface;
+
+    #[test]
+    fn collection_errors_remain_visible_in_compact_and_wide_tui() {
+        for width in [80, 120] {
+            let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+            let mut report =
+                crate::collector::CollectorDiagnostics::new("opencode", "local database");
+            report.fail("unsupported_schema");
+            app.collector.diagnostics.push(report);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
+            let contents: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(contents.contains("Collection failed"));
+            assert!(contents.contains("--diagnose"));
+        }
+    }
+
+    #[test]
+    fn session_without_confirmed_pid_cannot_jump_or_be_killed() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut session = waiting_session("opencode");
+        session.pid = 0;
+        session.status = SessionStatus::Unknown;
+        app.sessions.push(session);
+        assert_eq!(app.jump_to_session(), JumpOutcome::NoOp);
+        app.kill_selected();
+        assert!(app.kill_confirm.is_none());
+    }
 
     fn waiting_session(cli: &'static str) -> AgentSession {
         AgentSession {
