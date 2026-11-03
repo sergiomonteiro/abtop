@@ -76,20 +76,64 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Claude Code | Codex CLI | OpenCode |
-| ----------------- | :---------: | :-------: | :------: |
-| Session Discovery |     ✅      |    ✅     |    ✅    |
-| Token Tracking    |     ✅      |    ✅     |    ✅    |
-| Context Window %  |     ✅      |    ✅     |    ❌    |
-| Status Detection  |     ✅      |    ✅     |    ✅    |
-| Current Task      |     ✅      |    ✅     |    ❌    |
-| Rate Limit        |     ✅      |    ✅     |    ❌    |
-| Git Status        |     ✅      |    ✅     |    ✅    |
-| Children / Ports  |     ✅      |    ✅     |    ✅    |
-| Subagents         |     ✅      |    ❌     |    ❌    |
-| Memory Status     |     ✅      |    ❌     |    ❌    |
+✅ Supported when the required source is available · ◐ Partial/conditional coverage · ❌ Not collected.
+These are collector capabilities, not a guarantee that every discovered session has every metric.
 
-OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
+| Feature               | Claude Code | Codex CLI / App Server | OpenCode |
+| --------------------- | :---------: | :--------------------: | :------: |
+| Session Discovery     |     ✅      |           ✅           |    ✅    |
+| Token Tracking        |     ✅      |           ◐            |    ◐     |
+| Context Window %      |     ✅      |           ◐            |    ❌    |
+| Status Detection      |     ✅      |           ◐            |    ◐     |
+| Current Tool / Task   |     ✅      |           ◐            |    ❌    |
+| Rate Limit            |     ✅      |           ◐            |    ❌    |
+| Git Status            |     ✅      |           ✅           |    ✅    |
+| Children / Ports      |     ✅      |           ◐            |    ◐     |
+| Subagents             |     ✅      |           ❌           |    ❌    |
+| Memory Status         |     ✅      |           ❌           |    ❌    |
+| Collector Diagnostics |     ◐      |           ✅           |    ✅    |
+
+Coverage details:
+
+- **Codex CLI / App Server:** discovery includes eligible FD-owned App Server
+  rollouts, including non-Desktop originators. On Linux, verified argument-free
+  CLI processes can also appear before a rollout is available. These process-only
+  rows have `Unknown` activity, no transcript metrics, and no collected children.
+  Tokens, context, tasks, and quota require the corresponding rollout events;
+  process-tree/port attribution requires process-tree ownership. A daemon alone
+  is not a session.
+- **OpenCode:** both legacy and `session_v2` SQLite schemas are supported. Tokens
+  come from database-backed sessions; v2 cumulative totals are not current context
+  usage. Recent qualifying global-service activity can appear as `Unknown`
+  without assigning the service's PID, memory, children, or process controls.
+  This is a recent-activity heuristic, not proof of execution; old or idle unowned
+  rows remain hidden. On Linux, verified argument-free terminal processes can
+  appear without a matching database row, with `Unknown` activity and no
+  transcript metrics or collected children. Generic labels such as "thinking"
+  do not constitute tool/task tracking.
+- **Unavailable metrics:** the current model still uses zero for some unavailable
+  values, including OpenCode context percentage and process-only token counters.
+  Do not interpret these zeros as measured usage. Explicit availability is planned
+  in the roadmap.
+- **Status and controls:** status detection is heuristic for all agents. OpenCode
+  process matching also uses cwd/command evidence, not an authoritative session/PID
+  mapping. Rows without a PID cannot be killed or terminal-jumped.
+- **Diagnostics:** `--diagnose` provides detailed discovery/error/filter information
+  for Codex and OpenCode. Claude currently reports basic counts as
+  `not_instrumented`, not equivalent failure coverage. JSON snapshots and the TUI
+  also expose collection failures reported by collectors.
+- **Quota:** Claude requires the StatusLine setup and available account data;
+  Codex requires reported rollout rate-limit data. OpenCode does not contribute
+  quota data.
+
+OpenCode database collection requires `sqlite3` in `PATH` (on Windows:
+`winget install SQLite.SQLite`). The default database is
+`~/.local/share/opencode/opencode.db`; `XDG_DATA_HOME` overrides the data root.
+On Windows, `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as
+fallbacks. The Linux process-only fallback does not require a database.
+
+See [the collector audit](docs/collector-audit.md) for regression-test evidence,
+known heuristics, and remaining real-environment validation gaps.
 
 ## Themes
 
